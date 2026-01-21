@@ -129,8 +129,8 @@ class KernelBuilder:
 
     def rename_registers_pass(self, slots):
         """
-        Register renaming pass: assigns unique scratch addresses for each iteration
-        to expose parallelism. Interleaves iterations for better VLIW packing.
+        SSA-based register renaming with live range analysis for scratch reuse.
+        Interleaves iterations for vectorization while minimizing scratch usage.
         """
         # Find iteration pattern by store operations
         store_indices = [i for i, (e, s) in enumerate(slots) if e == "store"]
@@ -144,39 +144,82 @@ class KernelBuilder:
         if n_iters < 2:
             return slots
 
-        # Analyze one iteration to find internal scratch addresses
+        # Analyze one iteration to find internal scratch addresses and live ranges
         first_iter = slots[:iter_size]
         internal_defs = set()
-        for engine, slot in first_iter:
+
+        # Build def-use chains for live range analysis
+        addr_first_def = {}  # addr -> first instruction index that defines it
+        addr_last_use = {}   # addr -> last instruction index that uses it
+
+        for i, (engine, slot) in enumerate(first_iter):
             if engine == "debug":
                 continue
-            defs, _ = self.get_slot_def_use(engine, slot)
+            defs, uses = self.get_slot_def_use(engine, slot)
             internal_defs.update(defs)
+
+            for addr in defs:
+                if addr not in addr_first_def:
+                    addr_first_def[addr] = i
+            for addr in uses:
+                addr_last_use[addr] = i
 
         n_internal = len(internal_defs)
         if n_internal == 0:
             return slots
 
-        # Calculate maximum interleave factor based on scratch space
-        # Must be multiple of VLEN for vectorization
-        available_scratch = SCRATCH_SIZE - self.scratch_ptr
-        max_interleave = min(available_scratch // n_internal, n_iters)
-        # Try to use more interleave - use 2x VLEN chunks if possible
+        # Calculate live ranges: (start, end) for each internal address
+        live_ranges = {}
+        for addr in internal_defs:
+            start = addr_first_def.get(addr, 0)
+            end = addr_last_use.get(addr, iter_size - 1)
+            live_ranges[addr] = (start, end)
+
+        # Greedy interval coloring to minimize scratch usage
+        # Sort addresses by live range start
+        sorted_addrs = sorted(internal_defs, key=lambda a: live_ranges[a][0])
+
+        # Assign colors (scratch slots) to addresses
+        addr_to_color = {}
+        color_end_time = []  # For each color, when it becomes free
+
+        for addr in sorted_addrs:
+            start, end = live_ranges[addr]
+
+            # Find a free color (one that ended before this starts)
+            assigned = False
+            for color, end_time in enumerate(color_end_time):
+                if end_time < start:
+                    addr_to_color[addr] = color
+                    color_end_time[color] = end
+                    assigned = True
+                    break
+
+            if not assigned:
+                # Need a new color
+                addr_to_color[addr] = len(color_end_time)
+                color_end_time.append(end)
+
+        n_colors = len(color_end_time)
+
+        # Reserve space for broadcasts (estimate ~20 broadcasts * VLEN = 160)
+        broadcast_reserve = 20 * VLEN
+
+        # Calculate maximum interleave factor based on reduced scratch space
+        available_scratch = SCRATCH_SIZE - self.scratch_ptr - broadcast_reserve
+        max_interleave = min(available_scratch // n_colors, n_iters) if n_colors > 0 else n_iters
         max_interleave = (max_interleave // VLEN) * VLEN  # Round down to VLEN multiple
 
-        # Debug: print interleave info
-        # print(f"n_internal={n_internal}, available={available_scratch}, max_interleave={max_interleave}, n_iters={n_iters}")
+        # Debug: print optimization info
+        print(f"SSA: n_internal={n_internal}, n_colors={n_colors}, savings={n_internal - n_colors}")
+        print(f"available={available_scratch}, max_interleave={max_interleave}, n_iters={n_iters}")
 
         if max_interleave < VLEN:
             return slots
 
-        # Create mapping from original addr -> slot index
-        internal_list = sorted(internal_defs)
-        addr_to_slot = {addr: idx for idx, addr in enumerate(internal_list)}
-
-        # Allocate scratch space for renamed registers
+        # Allocate scratch space for renamed registers (using colors, not raw addresses)
         base_offset = self.scratch_ptr
-        self.scratch_ptr += max_interleave * n_internal
+        self.scratch_ptr += max_interleave * n_colors
 
         result = []
 
@@ -211,10 +254,62 @@ class KernelBuilder:
                             result.append((engine, slot))
                             continue
 
-                        new_slot = self.rename_slot_addrs(engine, slot, addr_to_slot, base_offset, lane, internal_defs, max_interleave)
+                        new_slot = self.rename_slot_addrs_ssa(engine, slot, addr_to_color, base_offset, lane, internal_defs, n_colors, max_interleave)
                         result.append((engine, new_slot))
 
         return result
+
+    def rename_slot_addrs_ssa(self, engine, slot, addr_to_color, base_offset, lane, internal_defs, n_colors, max_interleave):
+        """Rename addresses using SSA color assignments for better scratch reuse."""
+        def rename(addr):
+            if addr in internal_defs:
+                color = addr_to_color[addr]
+                # Layout for vectorization: consecutive lanes must be consecutive in memory
+                # [color0_lane0, color0_lane1, ..., color0_laneN, color1_lane0, ...]
+                return base_offset + color * max_interleave + lane
+            return addr
+
+        if engine == "alu":
+            op, dest, a1, a2 = slot
+            return (op, rename(dest), rename(a1), rename(a2))
+        elif engine == "valu":
+            if slot[0] == "vbroadcast":
+                _, dest, src = slot
+                return ("vbroadcast", rename(dest), rename(src))
+            else:
+                op, dest, a1, a2 = slot
+                return (op, rename(dest), rename(a1), rename(a2))
+        elif engine == "load":
+            if slot[0] == "load":
+                _, dest, addr = slot
+                return ("load", rename(dest), rename(addr))
+            elif slot[0] == "vload":
+                _, dest, addr = slot
+                return ("vload", rename(dest), rename(addr))
+            elif slot[0] == "const":
+                _, dest, val = slot
+                return ("const", rename(dest), val)
+            elif slot[0] == "load_offset":
+                _, dest, addr, offset = slot
+                return ("load_offset", rename(dest), rename(addr), offset)
+        elif engine == "store":
+            if slot[0] == "store":
+                _, addr, src = slot
+                return ("store", rename(addr), rename(src))
+            elif slot[0] == "vstore":
+                _, addr, src = slot
+                return ("vstore", rename(addr), rename(src))
+        elif engine == "flow":
+            if slot[0] == "select":
+                _, dest, cond, a, b = slot
+                return ("select", rename(dest), rename(cond), rename(a), rename(b))
+            elif slot[0] == "vselect":
+                _, dest, cond, a, b = slot
+                return ("vselect", rename(dest), rename(cond), rename(a), rename(b))
+            elif slot[0] == "pause":
+                return slot
+
+        return slot
 
     def rename_slot_addrs(self, engine, slot, addr_to_slot, base_offset, lane, internal_defs, max_interleave):
         """Rename internal addresses in a slot for the given lane."""
@@ -255,29 +350,28 @@ class KernelBuilder:
 
     def vectorize_pass(self, slots):
         """
-        Vectorization pass: converts groups of VLEN scalar operations into vector operations.
-        Only vectorizes when ALL operands are contiguous (no broadcast) to ensure correctness.
+        2-pass vectorization:
+        Pass 1: Identify all broadcast values needed and insert vbroadcast at the beginning
+        Pass 2: Convert VLEN scalar ops to vector ops using pre-computed broadcasts
         """
-        # Separate debug instructions - they shouldn't block vectorization
+        # Separate debug instructions
         non_debug = [(i, e, s) for i, (e, s) in enumerate(slots) if e != "debug"]
         debug_slots = [(i, e, s) for i, (e, s) in enumerate(slots) if e == "debug"]
 
-        result = []
-        i = 0
         n = len(non_debug)
-        broadcast_cache = {}  # scalar_addr -> vector_addr for reuse
 
+        # Pass 1: Find all broadcast values needed
+        broadcast_needed = set()
+        i = 0
         while i < n:
-            orig_idx, engine, slot = non_debug[i]
+            _, engine, slot = non_debug[i]
 
-            # Try to vectorize ALU operations (contiguous or broadcast operands)
             if engine == "alu" and i + VLEN <= n:
                 op, dest, a1, a2 = slot
                 can_vectorize = True
-                a1_is_broadcast = True  # All lanes use same a1
-                a2_is_broadcast = True  # All lanes use same a2
+                a1_is_broadcast = True
+                a2_is_broadcast = True
 
-                # Check if next VLEN instructions form a vectorizable group
                 for j in range(1, VLEN):
                     if i + j >= n:
                         can_vectorize = False
@@ -287,17 +381,14 @@ class KernelBuilder:
                         can_vectorize = False
                         break
                     next_op, next_dest, next_a1, next_a2 = next_slot
-                    # Check same operation and contiguous dest
                     if next_op != op or next_dest != dest + j:
                         can_vectorize = False
                         break
-                    # Check a1: contiguous or broadcast
                     if next_a1 != a1:
                         a1_is_broadcast = False
                         if next_a1 != a1 + j:
                             can_vectorize = False
                             break
-                    # Check a2: contiguous or broadcast
                     if next_a2 != a2:
                         a2_is_broadcast = False
                         if next_a2 != a2 + j:
@@ -305,36 +396,81 @@ class KernelBuilder:
                             break
 
                 if can_vectorize:
-                    # Handle broadcast operands with caching
-                    vec_a1 = a1
-                    vec_a2 = a2
                     if a1_is_broadcast:
-                        if a1 not in broadcast_cache:
-                            # Check if we have enough scratch space
-                            if self.scratch_ptr + VLEN <= SCRATCH_SIZE:
-                                broadcast_cache[a1] = self.alloc_scratch(length=VLEN)
-                                result.append(("valu", ("vbroadcast", broadcast_cache[a1], a1)))
-                            else:
-                                # No space for broadcast, skip vectorization
-                                result.append((engine, slot))
-                                i += 1
-                                continue
-                        vec_a1 = broadcast_cache[a1]
+                        broadcast_needed.add(a1)
                     if a2_is_broadcast:
-                        if a2 not in broadcast_cache:
-                            if self.scratch_ptr + VLEN <= SCRATCH_SIZE:
-                                broadcast_cache[a2] = self.alloc_scratch(length=VLEN)
-                                result.append(("valu", ("vbroadcast", broadcast_cache[a2], a2)))
-                            else:
-                                result.append((engine, slot))
-                                i += 1
-                                continue
-                        vec_a2 = broadcast_cache[a2]
-                    result.append(("valu", (op, dest, vec_a1, vec_a2)))
+                        broadcast_needed.add(a2)
                     i += VLEN
                     continue
 
-            # Try to vectorize select operations (only when ALL operands are contiguous)
+            i += 1
+
+        # Debug: print broadcast_needed (disabled)
+        # print(f"Broadcast needed: {sorted(broadcast_needed)[:20]}... (total {len(broadcast_needed)})")
+        # print(f"scratch_ptr before broadcast alloc: {self.scratch_ptr}")
+
+        # Allocate all broadcasts upfront
+        broadcast_cache = {}
+        broadcast_instrs = []
+        for addr in sorted(broadcast_needed):
+            if self.scratch_ptr + VLEN <= SCRATCH_SIZE:
+                vec_addr = self.alloc_scratch(length=VLEN)
+                broadcast_cache[addr] = vec_addr
+                broadcast_instrs.append(("valu", ("vbroadcast", vec_addr, addr)))
+
+        # print(f"broadcast_cache keys: {sorted(broadcast_cache.keys())[:20]}")
+
+        # Pass 2: Vectorize using pre-computed broadcasts
+        result = list(broadcast_instrs)  # Start with all broadcasts
+        i = 0
+        while i < n:
+            _, engine, slot = non_debug[i]
+
+            if engine == "alu" and i + VLEN <= n:
+                op, dest, a1, a2 = slot
+                can_vectorize = True
+                a1_is_broadcast = True
+                a2_is_broadcast = True
+
+                for j in range(1, VLEN):
+                    if i + j >= n:
+                        can_vectorize = False
+                        break
+                    _, next_engine, next_slot = non_debug[i + j]
+                    if next_engine != "alu":
+                        can_vectorize = False
+                        break
+                    next_op, next_dest, next_a1, next_a2 = next_slot
+                    if next_op != op or next_dest != dest + j:
+                        can_vectorize = False
+                        break
+                    if next_a1 != a1:
+                        a1_is_broadcast = False
+                        if next_a1 != a1 + j:
+                            can_vectorize = False
+                            break
+                    if next_a2 != a2:
+                        a2_is_broadcast = False
+                        if next_a2 != a2 + j:
+                            can_vectorize = False
+                            break
+
+                if can_vectorize:
+                    # Check if broadcast is needed but not available
+                    # If broadcast needed but not in cache, skip vectorization
+                    if a1_is_broadcast and a1 not in broadcast_cache:
+                        can_vectorize = False
+                    if a2_is_broadcast and a2 not in broadcast_cache:
+                        can_vectorize = False
+
+                    if can_vectorize:
+                        vec_a1 = broadcast_cache[a1] if a1_is_broadcast else a1
+                        vec_a2 = broadcast_cache[a2] if a2_is_broadcast else a2
+                        result.append(("valu", (op, dest, vec_a1, vec_a2)))
+                        i += VLEN
+                        continue
+
+            # Try to vectorize select operations
             if engine == "flow" and slot[0] == "select" and i + VLEN <= n:
                 _, dest, cond, a, b = slot
                 can_vectorize = True
@@ -348,7 +484,6 @@ class KernelBuilder:
                         can_vectorize = False
                         break
                     _, next_dest, next_cond, next_a, next_b = next_slot
-                    # Check ALL addresses contiguous
                     if (next_dest != dest + j or next_cond != cond + j or
                         next_a != a + j or next_b != b + j):
                         can_vectorize = False
@@ -359,11 +494,10 @@ class KernelBuilder:
                     i += VLEN
                     continue
 
-            # No vectorization possible, keep original instruction
             result.append((engine, slot))
             i += 1
 
-        # Add debug slots back at the end (they don't affect cycles)
+        # Add debug slots back
         for _, engine, slot in debug_slots:
             result.append((engine, slot))
 
@@ -697,43 +831,125 @@ class KernelBuilder:
     def vload_fusion_pass(self, slots):
         """
         Convert VLEN consecutive scalar loads from contiguous memory to a single vload.
+
         vload semantics: reads mem[scratch[addr]], mem[scratch[addr]+1], ..., mem[scratch[addr]+VLEN-1]
-        So we need: contiguous dest AND contiguous addr (where scratch[addr+j] = scratch[addr] + j)
+
+        This pass looks for patterns like:
+          alu: ('+', addr0, base, const0)  where scratch[const0] = 0
+          alu: ('+', addr1, base, const1)  where scratch[const1] = 1
+          ...
+          load: ('load', dest0, addr0)
+          load: ('load', dest1, addr1)
+          ...
+
+        And converts them to:
+          vload: ('vload', dest0, base)
+
+        This eliminates VLEN address calculations AND VLEN scalar loads.
         """
         result = []
         i = 0
         n = len(slots)
 
+        # Build reverse const map: scratch addr -> const value
+        addr_to_const = {addr: val for val, addr in self.const_map.items()}
+
         while i < n:
             engine, slot = slots[i]
 
-            # Try to fuse VLEN consecutive loads
-            if engine == "load" and slot[0] == "load" and i + VLEN <= n:
-                _, dest0, addr0 = slot
-                can_fuse = True
+            # Try to fuse VLEN consecutive loads that follow VLEN address calculations
+            if engine == "alu" and slot[0] == "+" and i + 2 * VLEN <= n:
+                # Check if this is the start of a fusable pattern:
+                # VLEN alu additions followed by VLEN loads
+                op, addr0, base0, const_addr0 = slot
 
-                # Check if next VLEN-1 loads form a fusable pattern
+                # The const address must contain a small integer offset (0, 1, 2, ...)
+                if const_addr0 not in addr_to_const:
+                    result.append((engine, slot))
+                    i += 1
+                    continue
+
+                offset0 = addr_to_const[const_addr0]
+
+                can_fuse = True
+                alu_slots = [slot]
+
+                # Check VLEN-1 more ALU ops with pattern: addr = base + const_j where const_j = offset0 + j
                 for j in range(1, VLEN):
                     if i + j >= n:
                         can_fuse = False
                         break
                     next_engine, next_slot = slots[i + j]
+                    if next_engine != "alu" or next_slot[0] != "+":
+                        can_fuse = False
+                        break
+                    _, next_addr, next_base, next_const_addr = next_slot
+                    # Must have same base and contiguous addr output
+                    if next_base != base0 or next_addr != addr0 + j:
+                        can_fuse = False
+                        break
+                    # Must have const that is offset0 + j
+                    if next_const_addr not in addr_to_const:
+                        can_fuse = False
+                        break
+                    if addr_to_const[next_const_addr] != offset0 + j:
+                        can_fuse = False
+                        break
+                    alu_slots.append(next_slot)
+
+                if not can_fuse:
+                    result.append((engine, slot))
+                    i += 1
+                    continue
+
+                # Now check VLEN loads following the ALU ops
+                load_start = i + VLEN
+                if load_start + VLEN > n:
+                    result.append((engine, slot))
+                    i += 1
+                    continue
+
+                load_e, load_s = slots[load_start]
+                if load_e != "load" or load_s[0] != "load":
+                    result.append((engine, slot))
+                    i += 1
+                    continue
+
+                _, dest0, load_addr0 = load_s
+                # The load addr must match the alu output
+                if load_addr0 != addr0:
+                    result.append((engine, slot))
+                    i += 1
+                    continue
+
+                # Check VLEN-1 more loads
+                for j in range(1, VLEN):
+                    idx = load_start + j
+                    if idx >= n:
+                        can_fuse = False
+                        break
+                    next_engine, next_slot = slots[idx]
                     if next_engine != "load" or next_slot[0] != "load":
                         can_fuse = False
                         break
-                    _, next_dest, next_addr = next_slot
-                    # Check contiguous dest AND contiguous addr
-                    if next_dest != dest0 + j or next_addr != addr0 + j:
+                    _, next_dest, next_load_addr = next_slot
+                    if next_dest != dest0 + j or next_load_addr != addr0 + j:
                         can_fuse = False
                         break
 
                 if can_fuse:
-                    # All loads have contiguous dest and addr
-                    # But vload needs a single addr that points to contiguous memory
-                    # This only works if scratch[addr0+j] = base + j for some base
-                    # We'll use load_offset instead for now
-                    result.append(("load", ("vload", dest0, addr0)))
-                    i += VLEN
+                    # We can fuse!
+                    # But vload needs base address that points to mem[base + offset0]
+                    # If offset0 != 0, we need to compute base + offset0 first
+                    if offset0 == 0:
+                        # Perfect - base0 already points to the right memory location
+                        result.append(("load", ("vload", dest0, base0)))
+                    else:
+                        # Need to add offset0 to base first
+                        # Keep the first alu to compute addr0 = base0 + offset0
+                        result.append(("alu", ("+", addr0, base0, const_addr0)))
+                        result.append(("load", ("vload", dest0, addr0)))
+                    i = load_start + VLEN
                     continue
 
             result.append((engine, slot))
@@ -744,39 +960,119 @@ class KernelBuilder:
     def vstore_fusion_pass(self, slots):
         """
         Convert VLEN consecutive scalar stores to contiguous memory to a single vstore.
+
         vstore semantics: writes scratch[src+0..VLEN-1] to mem[scratch[addr]], mem[scratch[addr]+1], ...
-        We need: contiguous addr AND contiguous src
+
+        This pass looks for patterns like:
+          alu: ('+', addr0, base, const0)  where scratch[const0] = 0
+          alu: ('+', addr1, base, const1)  where scratch[const1] = 1
+          ...
+          store: ('store', addr0, src0)
+          store: ('store', addr1, src1)
+          ...
+
+        And converts them to:
+          vstore: ('vstore', base, src0)
         """
         result = []
         i = 0
         n = len(slots)
 
+        # Build reverse const map: scratch addr -> const value
+        addr_to_const = {addr: val for val, addr in self.const_map.items()}
+
         while i < n:
             engine, slot = slots[i]
 
-            # Try to fuse VLEN consecutive stores
-            if engine == "store" and slot[0] == "store" and i + VLEN <= n:
-                _, addr0, src0 = slot
+            # Try to fuse VLEN consecutive stores that follow VLEN address calculations
+            if engine == "alu" and slot[0] == "+" and i + 2 * VLEN <= n:
+                # Check if this is the start of a fusable pattern:
+                # VLEN alu additions followed by VLEN stores
+                _, addr0, base0, const_addr0 = slot
+
+                # The const address must contain a small integer offset (0, 1, 2, ...)
+                if const_addr0 not in addr_to_const:
+                    result.append((engine, slot))
+                    i += 1
+                    continue
+
+                offset0 = addr_to_const[const_addr0]
+
                 can_fuse = True
 
-                # Check if next VLEN-1 stores form a fusable pattern
+                # Check VLEN-1 more ALU ops with pattern: addr = base + const_j where const_j = offset0 + j
                 for j in range(1, VLEN):
                     if i + j >= n:
                         can_fuse = False
                         break
                     next_engine, next_slot = slots[i + j]
+                    if next_engine != "alu" or next_slot[0] != "+":
+                        can_fuse = False
+                        break
+                    _, next_addr, next_base, next_const_addr = next_slot
+                    # Must have same base and contiguous addr output
+                    if next_base != base0 or next_addr != addr0 + j:
+                        can_fuse = False
+                        break
+                    # Must have const that is offset0 + j
+                    if next_const_addr not in addr_to_const:
+                        can_fuse = False
+                        break
+                    if addr_to_const[next_const_addr] != offset0 + j:
+                        can_fuse = False
+                        break
+
+                if not can_fuse:
+                    result.append((engine, slot))
+                    i += 1
+                    continue
+
+                # Now check VLEN stores following the ALU ops
+                store_start = i + VLEN
+                if store_start + VLEN > n:
+                    result.append((engine, slot))
+                    i += 1
+                    continue
+
+                store_e, store_s = slots[store_start]
+                if store_e != "store" or store_s[0] != "store":
+                    result.append((engine, slot))
+                    i += 1
+                    continue
+
+                _, store_addr0, src0 = store_s
+                # The store addr must match the alu output
+                if store_addr0 != addr0:
+                    result.append((engine, slot))
+                    i += 1
+                    continue
+
+                # Check VLEN-1 more stores
+                for j in range(1, VLEN):
+                    idx = store_start + j
+                    if idx >= n:
+                        can_fuse = False
+                        break
+                    next_engine, next_slot = slots[idx]
                     if next_engine != "store" or next_slot[0] != "store":
                         can_fuse = False
                         break
-                    _, next_addr, next_src = next_slot
-                    # Check contiguous addr AND contiguous src
-                    if next_addr != addr0 + j or next_src != src0 + j:
+                    _, next_store_addr, next_src = next_slot
+                    if next_store_addr != addr0 + j or next_src != src0 + j:
                         can_fuse = False
                         break
 
                 if can_fuse:
-                    result.append(("store", ("vstore", addr0, src0)))
-                    i += VLEN
+                    # We can fuse!
+                    # vstore needs base address that points to mem[base + offset0]
+                    if offset0 == 0:
+                        # Perfect - base0 already points to the right memory location
+                        result.append(("store", ("vstore", base0, src0)))
+                    else:
+                        # Need to add offset0 to base first
+                        result.append(("alu", ("+", addr0, base0, const_addr0)))
+                        result.append(("store", ("vstore", addr0, src0)))
+                    i = store_start + VLEN
                     continue
 
             result.append((engine, slot))
@@ -796,13 +1092,27 @@ class KernelBuilder:
         # slots = self.cse_pass(slots)
 
         # Apply register renaming with contiguous layout for vectorization
+        # This interleaves iterations so that VLEN ops are grouped together
         slots = self.rename_registers_pass(slots)
 
-        # vload/vstore fusion disabled - addr not contiguous across lanes
-        # slots = self.vload_fusion_pass(slots)
+        # Apply vload/vstore fusion AFTER renaming (now VLEN ops are grouped)
+        slots = self.vload_fusion_pass(slots)
+        slots = self.vstore_fusion_pass(slots)
+
+        # Dump pre-vectorization slots to file
+        with open("pre_vectorize.txt", "w") as f:
+            f.write(f"Total slots: {len(slots)}\n\n")
+            for i, (engine, slot) in enumerate(slots[:1000]):
+                f.write(f"{i}: {engine}: {slot}\n")
 
         # Apply vectorization pass to convert VLEN scalar ops to vector ops
         slots = self.vectorize_pass(slots)
+
+        # Dump post-vectorization slots to file
+        with open("post_vectorize.txt", "w") as f:
+            f.write(f"Total slots: {len(slots)}\n\n")
+            for i, (engine, slot) in enumerate(slots[:1000]):
+                f.write(f"{i}: {engine}: {slot}\n")
 
         # Filter out debug slots
         non_debug = [(i, e, s) for i, (e, s) in enumerate(slots) if e != "debug"]
@@ -995,9 +1305,19 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # Pre-allocate i_const values in CONTIGUOUS scratch locations for vload fusion
+        # This allows vload to load batch items with a single instruction
+        # IMPORTANT: Allocate these BEFORE zero_const/one_const/two_const so they're truly contiguous
+        i_const_base = self.alloc_scratch("i_const_base", batch_size)
+        for i in range(batch_size):
+            self.add("load", ("const", i_const_base + i, i))
+            # Register in const_map - OVERRIDE any previous allocation
+            self.const_map[i] = i_const_base + i
+
+        # Use the contiguous allocation for 0, 1, 2 as well
+        zero_const = i_const_base + 0  # = self.const_map[0]
+        one_const = i_const_base + 1   # = self.const_map[1]
+        two_const = i_const_base + 2   # = self.const_map[2]
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
@@ -1017,7 +1337,7 @@ class KernelBuilder:
 
         for round in range(rounds):
             for i in range(batch_size):
-                i_const = self.scratch_const(i)
+                i_const = i_const_base + i  # Use contiguous scratch address
                 # idx = mem[inp_indices_p + i]
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
                 body.append(("load", ("load", tmp_idx, tmp_addr)))
@@ -1140,6 +1460,27 @@ class Tests(unittest.TestCase):
 
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
+
+    def test_dump_instructions(self):
+        """Dump instructions to file for analysis"""
+        from problem import Tree, Input, build_mem_image
+        import random
+        random.seed(123)
+        forest = Tree.generate(10)
+        inp = Input.generate(forest, 256, 16)
+
+        kb = KernelBuilder()
+        kb.build_kernel(forest.height, len(forest.values), len(inp.indices), 16)
+
+        with open("instructions_dump.txt", "w") as f:
+            f.write(f"Total bundles: {len(kb.instrs)}\n\n")
+            for i, bundle in enumerate(kb.instrs[:1000]):
+                f.write(f"=== Cycle {i} ===\n")
+                for engine, slots in bundle.items():
+                    for slot in slots:
+                        f.write(f"  {engine}: {slot}\n")
+                f.write("\n")
+        print("Dumped to instructions_dump.txt")
 
 
 # To run all the tests:
