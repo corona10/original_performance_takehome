@@ -127,8 +127,327 @@ class KernelBuilder:
 
         return defs, uses
 
+    def rename_registers_pass(self, slots):
+        """
+        Register renaming pass: assigns unique scratch addresses for each iteration
+        to expose vectorization opportunities. Tracks when registers are written and
+        creates new virtual registers for each definition.
+        """
+        # First, identify the pattern: operations that repeat every N instructions
+        # with same structure but same dest addresses
+
+        # Find the iteration pattern by looking at store operations
+        # Each batch iteration ends with 2 stores (indices and values)
+        store_indices = [i for i, (e, s) in enumerate(slots) if e == "store"]
+
+        if len(store_indices) < 2:
+            return slots
+
+        # Determine iteration size: distance between corresponding stores
+        # Each iteration has 2 stores, so iteration size = store_indices[2] - store_indices[0]
+        if len(store_indices) >= 4:
+            iter_size = store_indices[2] - store_indices[0]
+        else:
+            return slots
+
+        # Verify the pattern repeats
+        n_iters = len(slots) // iter_size
+        if n_iters < 2:
+            return slots
+
+        # Analyze one iteration to find internal scratch addresses
+        first_iter = slots[:iter_size]
+
+        # Find addresses that are written (defined) within the iteration
+        internal_defs = set()
+        for engine, slot in first_iter:
+            if engine == "debug":
+                continue
+            defs, _ = self.get_slot_def_use(engine, slot)
+            internal_defs.update(defs)
+
+        n_internal = len(internal_defs)
+        if n_internal == 0:
+            return slots
+
+        # Calculate maximum interleave factor based on scratch space
+        available_scratch = SCRATCH_SIZE - self.scratch_ptr
+        max_interleave = min(available_scratch // n_internal, n_iters)
+
+        if max_interleave < 2:
+            return slots
+
+        # Create mapping from original addr -> base addr for renaming
+        internal_list = sorted(internal_defs)
+        addr_to_slot = {addr: idx for idx, addr in enumerate(internal_list)}
+
+        # Allocate scratch space for renamed registers
+        new_scratch_needed = max_interleave * n_internal
+        base_offset = self.scratch_ptr
+        self.scratch_ptr += new_scratch_needed
+
+        result = []
+
+        # Process in groups of max_interleave iterations
+        for group_start in range(0, n_iters, max_interleave):
+            group_size = min(max_interleave, n_iters - group_start)
+
+            if group_size < 2:
+                # Single iteration - no benefit from renaming
+                for iter_idx in range(group_start, group_start + group_size):
+                    iter_start = iter_idx * iter_size
+                    iter_end = iter_start + iter_size
+                    result.extend(slots[iter_start:iter_end])
+                continue
+
+            # Process group_size iterations together with renamed registers
+            # Interleave: emit same instruction from all iterations consecutively
+            for instr_offset in range(iter_size):
+                for lane in range(group_size):
+                    iter_idx = group_start + lane
+                    slot_idx = iter_idx * iter_size + instr_offset
+                    engine, slot = slots[slot_idx]
+
+                    if engine == "debug":
+                        result.append((engine, slot))
+                        continue
+
+                    new_slot = self.rename_slot_addrs(engine, slot, addr_to_slot, base_offset, lane, internal_defs, n_internal)
+                    result.append((engine, new_slot))
+
+        return result
+
+    def rename_slot_addrs(self, engine, slot, addr_to_slot, base_offset, lane, internal_defs, n_internal):
+        """Rename internal addresses in a slot for the given lane."""
+        def rename(addr):
+            if addr in internal_defs:
+                slot_idx = addr_to_slot[addr]
+                # Layout: lane0_reg0, lane0_reg1, ..., lane1_reg0, lane1_reg1, ...
+                return base_offset + lane * n_internal + slot_idx
+            return addr
+
+        if engine == "alu":
+            op, dest, a1, a2 = slot
+            return (op, rename(dest), rename(a1), rename(a2))
+        elif engine == "load":
+            if slot[0] == "load":
+                return ("load", rename(slot[1]), rename(slot[2]))
+            elif slot[0] == "const":
+                return ("const", rename(slot[1]), slot[2])
+            elif slot[0] == "vload":
+                return ("vload", rename(slot[1]), rename(slot[2]))
+            elif slot[0] == "load_offset":
+                return ("load_offset", rename(slot[1]), rename(slot[2]), slot[3])
+        elif engine == "store":
+            if slot[0] == "store":
+                return ("store", rename(slot[1]), rename(slot[2]))
+            elif slot[0] == "vstore":
+                return ("vstore", rename(slot[1]), rename(slot[2]))
+        elif engine == "flow":
+            if slot[0] == "select":
+                return ("select", rename(slot[1]), rename(slot[2]), rename(slot[3]), rename(slot[4]))
+            elif slot[0] == "vselect":
+                return ("vselect", rename(slot[1]), rename(slot[2]), rename(slot[3]), rename(slot[4]))
+            elif slot[0] == "pause":
+                return slot
+
+        return slot
+
+    def vectorize_pass(self, slots):
+        """
+        Vectorization pass: converts groups of VLEN scalar operations into vector operations.
+        Groups must have the same operation and contiguous destination addresses.
+        """
+        # Separate debug instructions - they shouldn't block vectorization
+        non_debug = [(i, e, s) for i, (e, s) in enumerate(slots) if e != "debug"]
+        debug_slots = [(i, e, s) for i, (e, s) in enumerate(slots) if e == "debug"]
+
+        result = []
+        i = 0
+        n = len(non_debug)
+        # Cache for broadcast vectors: scalar_addr -> vector_addr
+        broadcast_cache = {}
+
+        while i < n:
+            orig_idx, engine, slot = non_debug[i]
+
+            # Try to vectorize ALU operations
+            if engine == "alu" and i + VLEN <= n:
+                op, dest, a1, a2 = slot
+                can_vectorize = True
+                # Track if a1/a2 are broadcast (same for all lanes) or vector
+                a1_is_broadcast = True
+                a2_is_broadcast = True
+
+                # Check if next VLEN instructions form a vectorizable group
+                for j in range(1, VLEN):
+                    if i + j >= n:
+                        can_vectorize = False
+                        break
+                    _, next_engine, next_slot = non_debug[i + j]
+                    if next_engine != "alu":
+                        can_vectorize = False
+                        break
+                    next_op, next_dest, next_a1, next_a2 = next_slot
+                    # Check same operation and contiguous dest
+                    if next_op != op or next_dest != dest + j:
+                        can_vectorize = False
+                        break
+                    # Check a1: either contiguous or all same (broadcast)
+                    if next_a1 != a1:
+                        a1_is_broadcast = False
+                        if next_a1 != a1 + j:
+                            can_vectorize = False
+                            break
+                    # Check a2: either contiguous or all same (broadcast)
+                    if next_a2 != a2:
+                        a2_is_broadcast = False
+                        if next_a2 != a2 + j:
+                            can_vectorize = False
+                            break
+
+                if can_vectorize:
+                    # Need to broadcast scalar operands to vectors before valu
+                    if a1_is_broadcast:
+                        if a1 not in broadcast_cache:
+                            vec_a1 = self.alloc_scratch(length=VLEN)
+                            result.append(("valu", ("vbroadcast", vec_a1, a1)))
+                            broadcast_cache[a1] = vec_a1
+                        a1 = broadcast_cache[a1]
+                    if a2_is_broadcast:
+                        if a2 not in broadcast_cache:
+                            vec_a2 = self.alloc_scratch(length=VLEN)
+                            result.append(("valu", ("vbroadcast", vec_a2, a2)))
+                            broadcast_cache[a2] = vec_a2
+                        a2 = broadcast_cache[a2]
+                    result.append(("valu", (op, dest, a1, a2)))
+                    i += VLEN
+                    continue
+
+            # Try to vectorize select operations
+            if engine == "flow" and slot[0] == "select" and i + VLEN <= n:
+                _, dest, cond, a, b = slot
+                can_vectorize = True
+                # Track if a/b are broadcast (same for all lanes) or vector
+                a_is_broadcast = True
+                b_is_broadcast = True
+
+                for j in range(1, VLEN):
+                    if i + j >= n:
+                        can_vectorize = False
+                        break
+                    _, next_engine, next_slot = non_debug[i + j]
+                    if next_engine != "flow" or next_slot[0] != "select":
+                        can_vectorize = False
+                        break
+                    _, next_dest, next_cond, next_a, next_b = next_slot
+                    if next_dest != dest + j or next_cond != cond + j:
+                        can_vectorize = False
+                        break
+                    # Check a: either contiguous or all same (broadcast)
+                    if next_a != a:
+                        a_is_broadcast = False
+                        if next_a != a + j:
+                            can_vectorize = False
+                            break
+                    # Check b: either contiguous or all same (broadcast)
+                    if next_b != b:
+                        b_is_broadcast = False
+                        if next_b != b + j:
+                            can_vectorize = False
+                            break
+
+                if can_vectorize:
+                    # Need to broadcast scalar operands to vectors before vselect
+                    if a_is_broadcast:
+                        if a not in broadcast_cache:
+                            vec_a = self.alloc_scratch(length=VLEN)
+                            result.append(("valu", ("vbroadcast", vec_a, a)))
+                            broadcast_cache[a] = vec_a
+                        a = broadcast_cache[a]
+                    if b_is_broadcast:
+                        if b not in broadcast_cache:
+                            vec_b = self.alloc_scratch(length=VLEN)
+                            result.append(("valu", ("vbroadcast", vec_b, b)))
+                            broadcast_cache[b] = vec_b
+                        b = broadcast_cache[b]
+                    result.append(("flow", ("vselect", dest, cond, a, b)))
+                    i += VLEN
+                    continue
+
+            # No vectorization possible, keep original instruction
+            result.append((engine, slot))
+            i += 1
+
+        # Add debug slots back at the end (they don't affect cycles)
+        for _, engine, slot in debug_slots:
+            result.append((engine, slot))
+
+        return result
+
+    def super_instruction_pass(self, slots):
+        """
+        Super instruction: interleave multiple iterations to fill VLIW slots.
+        Find iteration boundaries and interleave independent operations.
+        """
+        # Find iteration pattern by looking at store operations
+        store_indices = [i for i, (e, s) in enumerate(slots) if e == "store"]
+
+        if len(store_indices) < 4:
+            return slots
+
+        # Each iteration has 2 stores, so iteration size = distance between 1st and 3rd store
+        iter_size = store_indices[2] - store_indices[0]
+        n_iters = len(slots) // iter_size
+
+        if n_iters < 2:
+            return slots
+
+        # Determine how many iterations to interleave based on slot limits
+        # We want to maximize parallelism while respecting slot limits
+        # load: 2 slots -> can do 2 loads per cycle
+        # store: 2 slots -> can do 2 stores per cycle
+        # alu: 12 slots -> can do 12 ALU ops per cycle
+        # flow: 1 slot -> can do 1 flow op per cycle (bottleneck for select)
+
+        # Count operations per iteration
+        ops_per_iter = defaultdict(int)
+        for e, s in slots[:iter_size]:
+            if e != "debug":
+                ops_per_iter[e] += 1
+
+        # Interleave factor: how many iterations can run in parallel
+        # Limited by the most constrained resource
+        interleave = min(
+            SLOT_LIMITS["alu"] // max(ops_per_iter.get("alu", 1), 1),
+            SLOT_LIMITS["load"] // max(ops_per_iter.get("load", 1), 1),
+            SLOT_LIMITS["store"] // max(ops_per_iter.get("store", 1), 1),
+            SLOT_LIMITS["flow"] // max(ops_per_iter.get("flow", 1), 1),
+            n_iters
+        )
+
+        if interleave < 2:
+            return slots
+
+        # Reorder: for each instruction position, emit that instruction from all interleaved iterations
+        result = []
+        for group_start in range(0, n_iters, interleave):
+            group_end = min(group_start + interleave, n_iters)
+            actual_interleave = group_end - group_start
+
+            for instr_idx in range(iter_size):
+                for iter_idx in range(group_start, group_end):
+                    slot_idx = iter_idx * iter_size + instr_idx
+                    if slot_idx < len(slots):
+                        result.append(slots[slot_idx])
+
+        return result
+
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
         """VLIW scheduling based on dependency analysis"""
+        # Apply register renaming with interleaving
+        slots = self.rename_registers_pass(slots)
+
         # Filter out debug slots
         non_debug = [(i, e, s) for i, (e, s) in enumerate(slots) if e != "debug"]
         debug_slots = [(i, e, s) for i, (e, s) in enumerate(slots) if e == "debug"]
