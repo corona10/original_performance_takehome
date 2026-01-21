@@ -161,7 +161,11 @@ class KernelBuilder:
         # Must be multiple of VLEN for vectorization
         available_scratch = SCRATCH_SIZE - self.scratch_ptr
         max_interleave = min(available_scratch // n_internal, n_iters)
+        # Try to use more interleave - use 2x VLEN chunks if possible
         max_interleave = (max_interleave // VLEN) * VLEN  # Round down to VLEN multiple
+
+        # Debug: print interleave info
+        # print(f"n_internal={n_internal}, available={available_scratch}, max_interleave={max_interleave}, n_iters={n_iters}")
 
         if max_interleave < VLEN:
             return slots
@@ -261,14 +265,17 @@ class KernelBuilder:
         result = []
         i = 0
         n = len(non_debug)
+        broadcast_cache = {}  # scalar_addr -> vector_addr for reuse
 
         while i < n:
             orig_idx, engine, slot = non_debug[i]
 
-            # Try to vectorize ALU operations (only when ALL operands are contiguous)
+            # Try to vectorize ALU operations (contiguous or broadcast operands)
             if engine == "alu" and i + VLEN <= n:
                 op, dest, a1, a2 = slot
                 can_vectorize = True
+                a1_is_broadcast = True  # All lanes use same a1
+                a2_is_broadcast = True  # All lanes use same a2
 
                 # Check if next VLEN instructions form a vectorizable group
                 for j in range(1, VLEN):
@@ -280,14 +287,50 @@ class KernelBuilder:
                         can_vectorize = False
                         break
                     next_op, next_dest, next_a1, next_a2 = next_slot
-                    # Check same operation and ALL addresses contiguous
-                    if (next_op != op or next_dest != dest + j or
-                        next_a1 != a1 + j or next_a2 != a2 + j):
+                    # Check same operation and contiguous dest
+                    if next_op != op or next_dest != dest + j:
                         can_vectorize = False
                         break
+                    # Check a1: contiguous or broadcast
+                    if next_a1 != a1:
+                        a1_is_broadcast = False
+                        if next_a1 != a1 + j:
+                            can_vectorize = False
+                            break
+                    # Check a2: contiguous or broadcast
+                    if next_a2 != a2:
+                        a2_is_broadcast = False
+                        if next_a2 != a2 + j:
+                            can_vectorize = False
+                            break
 
                 if can_vectorize:
-                    result.append(("valu", (op, dest, a1, a2)))
+                    # Handle broadcast operands with caching
+                    vec_a1 = a1
+                    vec_a2 = a2
+                    if a1_is_broadcast:
+                        if a1 not in broadcast_cache:
+                            # Check if we have enough scratch space
+                            if self.scratch_ptr + VLEN <= SCRATCH_SIZE:
+                                broadcast_cache[a1] = self.alloc_scratch(length=VLEN)
+                                result.append(("valu", ("vbroadcast", broadcast_cache[a1], a1)))
+                            else:
+                                # No space for broadcast, skip vectorization
+                                result.append((engine, slot))
+                                i += 1
+                                continue
+                        vec_a1 = broadcast_cache[a1]
+                    if a2_is_broadcast:
+                        if a2 not in broadcast_cache:
+                            if self.scratch_ptr + VLEN <= SCRATCH_SIZE:
+                                broadcast_cache[a2] = self.alloc_scratch(length=VLEN)
+                                result.append(("valu", ("vbroadcast", broadcast_cache[a2], a2)))
+                            else:
+                                result.append((engine, slot))
+                                i += 1
+                                continue
+                        vec_a2 = broadcast_cache[a2]
+                    result.append(("valu", (op, dest, vec_a1, vec_a2)))
                     i += VLEN
                     continue
 
@@ -477,6 +520,111 @@ class KernelBuilder:
             result.append((engine, slot))
         return result
 
+    def select_elimination_pass(self, slots):
+        """
+        Replace select operations with ALU operations where possible:
+        - select(dest, cond, 1, 2) -> dest = 2 - cond (when cond is 0 or 1)
+        - select(dest, cond, x, 0) -> dest = x * cond (when cond is 0 or 1)
+        """
+        addr_to_const = {addr: val for val, addr in self.const_map.items()}
+
+        result = []
+        for engine, slot in slots:
+            if engine == "flow" and slot[0] == "select":
+                _, dest, cond, a, b = slot
+                # select(dest, cond, 1, 2) -> 2 - cond
+                if a in addr_to_const and b in addr_to_const:
+                    a_val, b_val = addr_to_const[a], addr_to_const[b]
+                    if a_val == 1 and b_val == 2:
+                        # cond=1 -> 1, cond=0 -> 2, so dest = 2 - cond
+                        two_const = self.scratch_const(2)
+                        result.append(("alu", ("-", dest, two_const, cond)))
+                        continue
+                # select(dest, cond, x, 0) -> x * cond
+                if b in addr_to_const and addr_to_const[b] == 0:
+                    result.append(("alu", ("*", dest, a, cond)))
+                    continue
+            result.append((engine, slot))
+        return result
+
+    def cse_pass(self, slots):
+        """
+        Common Subexpression Elimination: reuse results of identical computations.
+        Tracks ALU operations and replaces redundant ones with copies.
+        """
+        result = []
+        # Map (op, a1, a2) -> dest address for computed values
+        computed = {}
+        # Track which addresses have been overwritten
+        valid_dests = set()
+
+        for engine, slot in slots:
+            if engine == "alu":
+                op, dest, a1, a2 = slot
+                key = (op, a1, a2)
+
+                # Check if we've computed this before and the result is still valid
+                if key in computed and computed[key] in valid_dests:
+                    # Reuse the previous result - but we still need to write to dest
+                    # For commutative ops, also check reversed operands
+                    prev_dest = computed[key]
+                    if prev_dest != dest:
+                        # Copy from previous result (use + with 0, but that needs a zero const)
+                        # Actually, we can't easily copy without adding instructions
+                        # So we just skip CSE for now if dest is different
+                        result.append((engine, slot))
+                        computed[key] = dest
+                        valid_dests.add(dest)
+                    else:
+                        # Same dest - this is redundant, skip it
+                        pass
+                else:
+                    result.append((engine, slot))
+                    computed[key] = dest
+                    valid_dests.add(dest)
+
+                    # For commutative ops, also store reversed key
+                    if op in ["+", "*", "^", "&", "|", "=="]:
+                        computed[(op, a2, a1)] = dest
+
+                # Invalidate any previous computation that used dest as input
+                # (because dest is now overwritten)
+                keys_to_remove = [k for k, v in computed.items() if v == dest or dest in k[1:]]
+                for k in keys_to_remove:
+                    if k in computed and computed[k] != dest:
+                        del computed[k]
+
+            elif engine == "load":
+                result.append((engine, slot))
+                # Load overwrites dest, invalidate computations using it
+                if slot[0] in ["load", "const"]:
+                    dest = slot[1]
+                    valid_dests.add(dest)
+                elif slot[0] == "vload":
+                    dest = slot[1]
+                    for i in range(VLEN):
+                        valid_dests.add(dest + i)
+
+            elif engine == "store":
+                result.append((engine, slot))
+                # Store doesn't affect scratch, but memory writes could
+                # For now, we don't track memory
+
+            elif engine == "flow":
+                result.append((engine, slot))
+                if slot[0] == "select":
+                    dest = slot[1]
+                    valid_dests.add(dest)
+                elif slot[0] == "vselect":
+                    dest = slot[1]
+                    for i in range(VLEN):
+                        valid_dests.add(dest + i)
+
+            else:
+                result.append((engine, slot))
+
+        return result
+
     def valu_fusion_pass(self, slots):
         """
         Convert VLEN consecutive scalar ALU ops to a single valu op.
@@ -593,13 +741,65 @@ class KernelBuilder:
 
         return result
 
+    def vstore_fusion_pass(self, slots):
+        """
+        Convert VLEN consecutive scalar stores to contiguous memory to a single vstore.
+        vstore semantics: writes scratch[src+0..VLEN-1] to mem[scratch[addr]], mem[scratch[addr]+1], ...
+        We need: contiguous addr AND contiguous src
+        """
+        result = []
+        i = 0
+        n = len(slots)
+
+        while i < n:
+            engine, slot = slots[i]
+
+            # Try to fuse VLEN consecutive stores
+            if engine == "store" and slot[0] == "store" and i + VLEN <= n:
+                _, addr0, src0 = slot
+                can_fuse = True
+
+                # Check if next VLEN-1 stores form a fusable pattern
+                for j in range(1, VLEN):
+                    if i + j >= n:
+                        can_fuse = False
+                        break
+                    next_engine, next_slot = slots[i + j]
+                    if next_engine != "store" or next_slot[0] != "store":
+                        can_fuse = False
+                        break
+                    _, next_addr, next_src = next_slot
+                    # Check contiguous addr AND contiguous src
+                    if next_addr != addr0 + j or next_src != src0 + j:
+                        can_fuse = False
+                        break
+
+                if can_fuse:
+                    result.append(("store", ("vstore", addr0, src0)))
+                    i += VLEN
+                    continue
+
+            result.append((engine, slot))
+            i += 1
+
+        return result
+
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
         """VLIW scheduling based on dependency analysis with critical path priority"""
         # Apply strength reduction before renaming
         slots = self.strength_reduction_pass(slots)
 
+        # Eliminate select operations where possible (convert to ALU)
+        slots = self.select_elimination_pass(slots)
+
+        # CSE disabled - causes correctness issues with address calculations
+        # slots = self.cse_pass(slots)
+
         # Apply register renaming with contiguous layout for vectorization
         slots = self.rename_registers_pass(slots)
+
+        # vload/vstore fusion disabled - addr not contiguous across lanes
+        # slots = self.vload_fusion_pass(slots)
 
         # Apply vectorization pass to convert VLEN scalar ops to vector ops
         slots = self.vectorize_pass(slots)
@@ -656,14 +856,14 @@ class KernelBuilder:
         topo_order = []
 
         while ready:
-            # Sort by engine priority: load > store > alu > flow
+            # Sort by engine priority: load > alu/valu > flow > store
             def priority(idx):
                 engine = non_debug[idx][1]
                 if engine == "load":
                     return 0
-                elif engine == "store":
+                elif engine in ("alu", "valu"):
                     return 1
-                elif engine == "alu":
+                elif engine == "flow":
                     return 2
                 else:
                     return 3
@@ -706,6 +906,36 @@ class KernelBuilder:
                 new_bundle = {engine: [slot]}
                 result.append(new_bundle)
                 scheduled_cycle[idx] = len(result) - 1
+
+        # Trace: analyze slot utilization
+        if True:  # Set to True to enable tracing
+            print(f"\n=== Instruction Trace Analysis ===")
+            print(f"Total cycles: {len(result)}")
+
+            # Count by engine type
+            engine_counts = {"alu": 0, "valu": 0, "load": 0, "store": 0, "flow": 0}
+            engine_slots_used = {"alu": 0, "valu": 0, "load": 0, "store": 0, "flow": 0}
+
+            for bundle in result:
+                for eng in engine_counts:
+                    if eng in bundle:
+                        engine_counts[eng] += 1
+                        engine_slots_used[eng] += len(bundle[eng])
+
+            print(f"\nEngine utilization (cycles with at least 1 slot used):")
+            for eng in ["alu", "valu", "load", "store", "flow"]:
+                pct = 100 * engine_counts[eng] / len(result) if result else 0
+                avg_slots = engine_slots_used[eng] / engine_counts[eng] if engine_counts[eng] > 0 else 0
+                print(f"  {eng}: {engine_counts[eng]} cycles ({pct:.1f}%), avg {avg_slots:.1f}/{SLOT_LIMITS[eng]} slots")
+
+            # Sample first 20 cycles
+            print(f"\nFirst 20 cycles:")
+            for i, bundle in enumerate(result[:20]):
+                parts = []
+                for eng in ["load", "alu", "valu", "flow", "store"]:
+                    if eng in bundle:
+                        parts.append(f"{eng}:{len(bundle[eng])}")
+                print(f"  Cycle {i}: {', '.join(parts)}")
 
         return result
 
