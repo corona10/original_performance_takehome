@@ -45,12 +45,183 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
+    def get_slot_def_use(self, engine, slot):
+        """Return the set of defined (dest) and used (src) scratch addresses for a slot"""
+        defs = set()
+        uses = set()
+
+        if engine == "debug":
+            return defs, uses
+
+        if engine == "alu":
+            # (op, dest, a1, a2)
+            op, dest, a1, a2 = slot
+            defs.add(dest)
+            uses.add(a1)
+            uses.add(a2)
+        elif engine == "valu":
+            if slot[0] == "vbroadcast":
+                # ("vbroadcast", dest, src)
+                _, dest, src = slot
+                for i in range(VLEN):
+                    defs.add(dest + i)
+                uses.add(src)
+            else:
+                # (op, dest, a1, a2) - vector operation
+                op, dest, a1, a2 = slot
+                for i in range(VLEN):
+                    defs.add(dest + i)
+                    uses.add(a1 + i)
+                    uses.add(a2 + i)
+        elif engine == "load":
+            if slot[0] == "load":
+                # ("load", dest, addr)
+                _, dest, addr = slot
+                defs.add(dest)
+                uses.add(addr)
+            elif slot[0] == "vload":
+                # ("vload", dest, addr) - addr is scalar, dest is vector
+                _, dest, addr = slot
+                for i in range(VLEN):
+                    defs.add(dest + i)
+                uses.add(addr)
+            elif slot[0] == "const":
+                # ("const", dest, val)
+                _, dest, val = slot
+                defs.add(dest)
+            elif slot[0] == "load_offset":
+                # ("load_offset", dest, addr, offset)
+                _, dest, addr, offset = slot
+                defs.add(dest + offset)
+                uses.add(addr + offset)
+        elif engine == "store":
+            if slot[0] == "store":
+                # ("store", addr, src)
+                _, addr, src = slot
+                uses.add(addr)
+                uses.add(src)
+            elif slot[0] == "vstore":
+                # ("vstore", addr, src) - addr is scalar, src is vector
+                _, addr, src = slot
+                uses.add(addr)
+                for i in range(VLEN):
+                    uses.add(src + i)
+        elif engine == "flow":
+            if slot[0] == "select":
+                # ("select", dest, cond, a, b)
+                _, dest, cond, a, b = slot
+                defs.add(dest)
+                uses.add(cond)
+                uses.add(a)
+                uses.add(b)
+            elif slot[0] == "vselect":
+                # ("vselect", dest, cond, a, b) - all vectors
+                _, dest, cond, a, b = slot
+                for i in range(VLEN):
+                    defs.add(dest + i)
+                    uses.add(cond + i)
+                    uses.add(a + i)
+                    uses.add(b + i)
+            elif slot[0] == "pause":
+                pass
+
+        return defs, uses
+
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
+        """VLIW scheduling based on dependency analysis"""
+        # Filter out debug slots
+        non_debug = [(i, e, s) for i, (e, s) in enumerate(slots) if e != "debug"]
+        debug_slots = [(i, e, s) for i, (e, s) in enumerate(slots) if e == "debug"]
+
+        if not non_debug:
+            return []
+
+        # Dependency analysis: which instructions must execute after which
+        n = len(non_debug)
+        deps = [set() for _ in range(n)]  # deps[i] = set of instruction indices that i depends on
+
+        # Last instruction that defined each scratch address
+        last_def = {}
+        # Instructions that used each scratch address
+        last_use = defaultdict(set)
+
+        for idx, (orig_i, engine, slot) in enumerate(non_debug):
+            defs, uses = self.get_slot_def_use(engine, slot)
+
+            # RAW (Read After Write): depend on instruction that wrote to address I read
+            for addr in uses:
+                if addr in last_def:
+                    deps[idx].add(last_def[addr])
+
+            # WAW (Write After Write): depend on instruction that wrote to address I write
+            for addr in defs:
+                if addr in last_def:
+                    deps[idx].add(last_def[addr])
+
+            # WAR (Write After Read): depend on instructions that read address I write
+            for addr in defs:
+                for prev_idx in last_use[addr]:
+                    deps[idx].add(prev_idx)
+
+            # Update tracking
+            for addr in defs:
+                last_def[addr] = idx
+                last_use[addr] = set()
+            for addr in uses:
+                last_use[addr].add(idx)
+
+        # Topological sort (Kahn's algorithm)
+        in_degree = [len(deps[i]) for i in range(n)]
+        # Reverse graph: who depends on me
+        dependents = [[] for _ in range(n)]
+        for idx in range(n):
+            for dep in deps[idx]:
+                dependents[dep].append(idx)
+
+        queue = [i for i in range(n) if in_degree[i] == 0]
+        topo_order = []
+
+        while queue:
+            idx = queue.pop(0)
+            topo_order.append(idx)
+            for dep_idx in dependents[idx]:
+                in_degree[dep_idx] -= 1
+                if in_degree[dep_idx] == 0:
+                    queue.append(dep_idx)
+
+        if len(topo_order) != n:
+            raise RuntimeError("Cycle in dependencies!")
+
+        # Pack instructions into bundles respecting slot limits, in topo order
+        result = []
+        scheduled_cycle = [-1] * n  # Cycle each instruction is scheduled in
+
+        for idx in topo_order:
+            _, engine, slot = non_debug[idx]
+
+            # Find the latest cycle among instructions this one depends on
+            if deps[idx]:
+                earliest_cycle = max(scheduled_cycle[dep] for dep in deps[idx]) + 1
+            else:
+                earliest_cycle = 0
+
+            # Find a cycle starting from earliest_cycle with available slot
+            placed = False
+            for cycle_idx in range(earliest_cycle, len(result)):
+                bundle = result[cycle_idx]
+                if len(bundle.get(engine, [])) < SLOT_LIMITS[engine]:
+                    bundle.setdefault(engine, []).append(slot)
+                    scheduled_cycle[idx] = cycle_idx
+                    placed = True
+                    break
+
+            if not placed:
+                # Create new bundle
+                new_bundle = {engine: [slot]}
+                result.append(new_bundle)
+                scheduled_cycle[idx] = len(result) - 1
+
+        return result
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
