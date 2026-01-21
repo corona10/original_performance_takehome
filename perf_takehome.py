@@ -1095,9 +1095,10 @@ class KernelBuilder:
         # This interleaves iterations so that VLEN ops are grouped together
         slots = self.rename_registers_pass(slots)
 
-        # Apply vload/vstore fusion AFTER renaming (now VLEN ops are grouped)
+        # Apply vload/vstore/vselect fusion AFTER renaming (now VLEN ops are grouped)
         slots = self.vload_fusion_pass(slots)
         slots = self.vstore_fusion_pass(slots)
+        slots = self.vselect_fusion_pass(slots)
 
         # Dump pre-vectorization slots to file
         with open("pre_vectorize.txt", "w") as f:
