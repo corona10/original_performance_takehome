@@ -311,43 +311,6 @@ class KernelBuilder:
 
         return slot
 
-    def rename_slot_addrs(self, engine, slot, addr_to_slot, base_offset, lane, internal_defs, max_interleave):
-        """Rename internal addresses in a slot for the given lane."""
-        def rename(addr):
-            if addr in internal_defs:
-                slot_idx = addr_to_slot[addr]
-                # Layout: reg0_lane0, reg0_lane1, ..., reg1_lane0, reg1_lane1, ...
-                # This makes same register across lanes contiguous for vectorization
-                return base_offset + slot_idx * max_interleave + lane
-            return addr
-
-        if engine == "alu":
-            op, dest, a1, a2 = slot
-            return (op, rename(dest), rename(a1), rename(a2))
-        elif engine == "load":
-            if slot[0] == "load":
-                return ("load", rename(slot[1]), rename(slot[2]))
-            elif slot[0] == "const":
-                return ("const", rename(slot[1]), slot[2])
-            elif slot[0] == "vload":
-                return ("vload", rename(slot[1]), rename(slot[2]))
-            elif slot[0] == "load_offset":
-                return ("load_offset", rename(slot[1]), rename(slot[2]), slot[3])
-        elif engine == "store":
-            if slot[0] == "store":
-                return ("store", rename(slot[1]), rename(slot[2]))
-            elif slot[0] == "vstore":
-                return ("vstore", rename(slot[1]), rename(slot[2]))
-        elif engine == "flow":
-            if slot[0] == "select":
-                return ("select", rename(slot[1]), rename(slot[2]), rename(slot[3]), rename(slot[4]))
-            elif slot[0] == "vselect":
-                return ("vselect", rename(slot[1]), rename(slot[2]), rename(slot[3]), rename(slot[4]))
-            elif slot[0] == "pause":
-                return slot
-
-        return slot
-
     def vectorize_pass(self, slots):
         """
         2-pass vectorization:
@@ -500,64 +463,6 @@ class KernelBuilder:
         # Add debug slots back
         for _, engine, slot in debug_slots:
             result.append((engine, slot))
-
-        return result
-
-    def super_instruction_pass(self, slots):
-        """
-        Super instruction: interleave multiple iterations to fill VLIW slots.
-        Find iteration boundaries and interleave independent operations.
-        """
-        # Find iteration pattern by looking at store operations
-        store_indices = [i for i, (e, s) in enumerate(slots) if e == "store"]
-
-        if len(store_indices) < 4:
-            return slots
-
-        # Each iteration has 2 stores, so iteration size = distance between 1st and 3rd store
-        iter_size = store_indices[2] - store_indices[0]
-        n_iters = len(slots) // iter_size
-
-        if n_iters < 2:
-            return slots
-
-        # Determine how many iterations to interleave based on slot limits
-        # We want to maximize parallelism while respecting slot limits
-        # load: 2 slots -> can do 2 loads per cycle
-        # store: 2 slots -> can do 2 stores per cycle
-        # alu: 12 slots -> can do 12 ALU ops per cycle
-        # flow: 1 slot -> can do 1 flow op per cycle (bottleneck for select)
-
-        # Count operations per iteration
-        ops_per_iter = defaultdict(int)
-        for e, s in slots[:iter_size]:
-            if e != "debug":
-                ops_per_iter[e] += 1
-
-        # Interleave factor: how many iterations can run in parallel
-        # Limited by the most constrained resource
-        interleave = min(
-            SLOT_LIMITS["alu"] // max(ops_per_iter.get("alu", 1), 1),
-            SLOT_LIMITS["load"] // max(ops_per_iter.get("load", 1), 1),
-            SLOT_LIMITS["store"] // max(ops_per_iter.get("store", 1), 1),
-            SLOT_LIMITS["flow"] // max(ops_per_iter.get("flow", 1), 1),
-            n_iters
-        )
-
-        if interleave < 2:
-            return slots
-
-        # Reorder: for each instruction position, emit that instruction from all interleaved iterations
-        result = []
-        for group_start in range(0, n_iters, interleave):
-            group_end = min(group_start + interleave, n_iters)
-            actual_interleave = group_end - group_start
-
-            for instr_idx in range(iter_size):
-                for iter_idx in range(group_start, group_end):
-                    slot_idx = iter_idx * iter_size + instr_idx
-                    if slot_idx < len(slots):
-                        result.append(slots[slot_idx])
 
         return result
 
