@@ -629,31 +629,6 @@ class KernelBuilder:
 
         return result
 
-    def strength_reduction_pass(self, slots):
-        """
-        Replace expensive operations with cheaper equivalents:
-        - x * 2 -> x + x
-        - x % 2 -> x & 1
-        """
-        # Build reverse map: addr -> value
-        addr_to_const = {addr: val for val, addr in self.const_map.items()}
-
-        result = []
-        for engine, slot in slots:
-            if engine == "alu":
-                op, dest, a1, a2 = slot
-                # x * 2 -> x + x
-                if op == "*" and a2 in addr_to_const and addr_to_const[a2] == 2:
-                    result.append(("alu", ("+", dest, a1, a1)))
-                    continue
-                # x % 2 -> x & 1
-                if op == "%" and a2 in addr_to_const and addr_to_const[a2] == 2:
-                    one_const = self.scratch_const(1)
-                    result.append(("alu", ("&", dest, a1, one_const)))
-                    continue
-            result.append((engine, slot))
-        return result
-
     def select_elimination_pass(self, slots):
         """
         Replace select operations with ALU operations where possible:
@@ -689,8 +664,10 @@ class KernelBuilder:
         result = []
         # Map (op, a1, a2) -> dest address for computed values
         computed = {}
-        # Track which addresses have been overwritten
-        valid_dests = set()
+        # Reverse map: addr -> set of keys that use this addr as operand
+        addr_to_keys = defaultdict(set)
+        # Reverse map: dest -> set of keys that have this dest
+        dest_to_keys = defaultdict(set)
 
         for engine, slot in slots:
             if engine == "alu":
@@ -698,61 +675,88 @@ class KernelBuilder:
                 key = (op, a1, a2)
 
                 # Check if we've computed this before and the result is still valid
-                if key in computed and computed[key] in valid_dests:
-                    # Reuse the previous result - but we still need to write to dest
-                    # For commutative ops, also check reversed operands
+                if key in computed:
                     prev_dest = computed[key]
-                    if prev_dest != dest:
-                        # Copy from previous result (use + with 0, but that needs a zero const)
-                        # Actually, we can't easily copy without adding instructions
-                        # So we just skip CSE for now if dest is different
-                        result.append((engine, slot))
-                        computed[key] = dest
-                        valid_dests.add(dest)
-                    else:
+                    if prev_dest == dest:
                         # Same dest - this is redundant, skip it
-                        pass
-                else:
-                    result.append((engine, slot))
-                    computed[key] = dest
-                    valid_dests.add(dest)
+                        continue
+                    # Different dest - can't easily reuse, just compute again
 
-                    # For commutative ops, also store reversed key
-                    if op in ["+", "*", "^", "&", "|", "=="]:
-                        computed[(op, a2, a1)] = dest
+                result.append((engine, slot))
 
-                # Invalidate any previous computation that used dest as input
-                # (because dest is now overwritten)
-                keys_to_remove = [k for k, v in computed.items() if v == dest or dest in k[1:]]
-                for k in keys_to_remove:
-                    if k in computed and computed[k] != dest:
-                        del computed[k]
+                # Invalidate previous computations that wrote to dest
+                for old_key in list(dest_to_keys.get(dest, [])):
+                    if old_key in computed:
+                        del computed[old_key]
+                    dest_to_keys[dest].discard(old_key)
+
+                # Invalidate computations that used dest as input
+                for old_key in list(addr_to_keys.get(dest, [])):
+                    if old_key in computed:
+                        old_dest = computed[old_key]
+                        dest_to_keys[old_dest].discard(old_key)
+                        del computed[old_key]
+                    addr_to_keys[dest].discard(old_key)
+
+                # Store new computation
+                computed[key] = dest
+                dest_to_keys[dest].add(key)
+                addr_to_keys[a1].add(key)
+                addr_to_keys[a2].add(key)
+
+                # For commutative ops, also store reversed key
+                if op in ["+", "*", "^", "&", "|", "=="]:
+                    rev_key = (op, a2, a1)
+                    computed[rev_key] = dest
+                    dest_to_keys[dest].add(rev_key)
+                    addr_to_keys[a1].add(rev_key)
+                    addr_to_keys[a2].add(rev_key)
 
             elif engine == "load":
                 result.append((engine, slot))
-                # Load overwrites dest, invalidate computations using it
-                if slot[0] in ["load", "const"]:
+                # Load overwrites dest, invalidate computations
+                if slot[0] in ["load", "const", "load_offset"]:
                     dest = slot[1]
-                    valid_dests.add(dest)
+                    for old_key in list(addr_to_keys.get(dest, [])):
+                        if old_key in computed:
+                            old_dest = computed[old_key]
+                            dest_to_keys[old_dest].discard(old_key)
+                            del computed[old_key]
+                        addr_to_keys[dest].discard(old_key)
                 elif slot[0] == "vload":
                     dest = slot[1]
                     for i in range(VLEN):
-                        valid_dests.add(dest + i)
+                        d = dest + i
+                        for old_key in list(addr_to_keys.get(d, [])):
+                            if old_key in computed:
+                                old_dest = computed[old_key]
+                                dest_to_keys[old_dest].discard(old_key)
+                                del computed[old_key]
+                            addr_to_keys[d].discard(old_key)
 
             elif engine == "store":
                 result.append((engine, slot))
-                # Store doesn't affect scratch, but memory writes could
-                # For now, we don't track memory
 
             elif engine == "flow":
                 result.append((engine, slot))
                 if slot[0] == "select":
                     dest = slot[1]
-                    valid_dests.add(dest)
+                    for old_key in list(addr_to_keys.get(dest, [])):
+                        if old_key in computed:
+                            old_dest = computed[old_key]
+                            dest_to_keys[old_dest].discard(old_key)
+                            del computed[old_key]
+                        addr_to_keys[dest].discard(old_key)
                 elif slot[0] == "vselect":
                     dest = slot[1]
                     for i in range(VLEN):
-                        valid_dests.add(dest + i)
+                        d = dest + i
+                        for old_key in list(addr_to_keys.get(d, [])):
+                            if old_key in computed:
+                                old_dest = computed[old_key]
+                                dest_to_keys[old_dest].discard(old_key)
+                                del computed[old_key]
+                            addr_to_keys[d].discard(old_key)
 
             else:
                 result.append((engine, slot))
@@ -1082,37 +1086,40 @@ class KernelBuilder:
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
         """VLIW scheduling based on dependency analysis with critical path priority"""
-        # Apply strength reduction before renaming
-        slots = self.strength_reduction_pass(slots)
+        # Strength reduction disabled - all ALU ops are same cost (1 cycle)
+        # slots = self.strength_reduction_pass(slots)
 
         # Eliminate select operations where possible (convert to ALU)
         slots = self.select_elimination_pass(slots)
-
-        # CSE disabled - causes correctness issues with address calculations
-        # slots = self.cse_pass(slots)
 
         # Apply register renaming with contiguous layout for vectorization
         # This interleaves iterations so that VLEN ops are grouped together
         slots = self.rename_registers_pass(slots)
 
-        # Apply vload/vstore/vselect fusion AFTER renaming (now VLEN ops are grouped)
-        slots = self.vload_fusion_pass(slots)
-        slots = self.vstore_fusion_pass(slots)
-        slots = self.vselect_fusion_pass(slots)
+        # Apply optimization passes repeatedly until no change
+        prev_len = -1
+        iteration = 0
+        while len(slots) != prev_len:
+            prev_len = len(slots)
+            iteration += 1
 
-        # Dump pre-vectorization slots to file
-        with open("pre_vectorize.txt", "w") as f:
-            f.write(f"Total slots: {len(slots)}\n\n")
-            for i, (engine, slot) in enumerate(slots[:1000]):
-                f.write(f"{i}: {engine}: {slot}\n")
+            # Apply vload/vstore/vselect fusion
+            slots = self.vload_fusion_pass(slots)
+            slots = self.vstore_fusion_pass(slots)
+            slots = self.vselect_fusion_pass(slots)
 
-        # Apply vectorization pass to convert VLEN scalar ops to vector ops
-        slots = self.vectorize_pass(slots)
+            # Apply vectorization pass
+            slots = self.vectorize_pass(slots)
 
-        # Dump post-vectorization slots to file
+            # CSE pass
+            slots = self.cse_pass(slots)
+
+        print(f"Optimization converged after {iteration} iterations")
+
+        # Dump optimized slots to file
         with open("post_vectorize.txt", "w") as f:
             f.write(f"Total slots: {len(slots)}\n\n")
-            for i, (engine, slot) in enumerate(slots[:1000]):
+            for i, (engine, slot) in enumerate(slots):
                 f.write(f"{i}: {engine}: {slot}\n")
 
         # Filter out debug slots
