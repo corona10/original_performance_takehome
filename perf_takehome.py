@@ -127,10 +127,11 @@ class KernelBuilder:
 
         return defs, uses
 
-    def rename_registers_pass(self, slots):
+    def iteration_interleaving_pass(self, slots):
         """
-        SSA-based register renaming with live range analysis for scratch reuse.
-        Interleaves iterations for vectorization while minimizing scratch usage.
+        Iteration interleaving with live range analysis for scratch reuse.
+        Reorders iterations for vectorization opportunities while minimizing scratch usage
+        through interval graph coloring-based register allocation.
         """
         # Find iteration pattern by store operations
         store_indices = [i for i, (e, s) in enumerate(slots) if e == "store"]
@@ -211,7 +212,7 @@ class KernelBuilder:
         max_interleave = (max_interleave // VLEN) * VLEN  # Round down to VLEN multiple
 
         # Debug: print optimization info
-        print(f"SSA: n_internal={n_internal}, n_colors={n_colors}, savings={n_internal - n_colors}")
+        print(f"Register allocation: n_internal={n_internal}, n_colors={n_colors}, savings={n_internal - n_colors}")
         print(f"available={available_scratch}, max_interleave={max_interleave}, n_iters={n_iters}")
 
         if max_interleave < VLEN:
@@ -254,13 +255,13 @@ class KernelBuilder:
                             result.append((engine, slot))
                             continue
 
-                        new_slot = self.rename_slot_addrs_ssa(engine, slot, addr_to_color, base_offset, lane, internal_defs, n_colors, max_interleave)
+                        new_slot = self.rename_slot_addrs_with_coloring(engine, slot, addr_to_color, base_offset, lane, internal_defs, n_colors, max_interleave)
                         result.append((engine, new_slot))
 
         return result
 
-    def rename_slot_addrs_ssa(self, engine, slot, addr_to_color, base_offset, lane, internal_defs, n_colors, max_interleave):
-        """Rename addresses using SSA color assignments for better scratch reuse."""
+    def rename_slot_addrs_with_coloring(self, engine, slot, addr_to_color, base_offset, lane, internal_defs, n_colors, max_interleave):
+        """Rename addresses using interval graph coloring for better scratch reuse."""
         def rename(addr):
             if addr in internal_defs:
                 color = addr_to_color[addr]
@@ -997,9 +998,9 @@ class KernelBuilder:
         # Eliminate select operations where possible (convert to ALU)
         slots = self.select_elimination_pass(slots)
 
-        # Apply register renaming with contiguous layout for vectorization
-        # This interleaves iterations so that VLEN ops are grouped together
-        slots = self.rename_registers_pass(slots)
+        # Apply iteration interleaving with register allocation for vectorization
+        # This reorders iterations so that VLEN ops are grouped together
+        slots = self.iteration_interleaving_pass(slots)
 
         # Apply optimization passes repeatedly until no change
         prev_len = -1
