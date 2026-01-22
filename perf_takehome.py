@@ -1246,9 +1246,26 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        # Pipeline init_vars loads using tmp1/tmp2 alternately for parallelism
+        # Cycle 0: const tmp1, 0
+        # Cycle 1: load v0, tmp1 | const tmp2, 1
+        # Cycle 2: load v1, tmp2 | const tmp1, 2
+        # ... (8 cycles instead of 14)
+        n_vars = len(init_vars)
+        self.add("load", ("const", tmp1, 0))  # First const alone
+        for i in range(n_vars):
+            curr_tmp = tmp1 if i % 2 == 0 else tmp2
+            next_tmp = tmp2 if i % 2 == 0 else tmp1
+            if i + 1 < n_vars:
+                # Pack: load current var | const for next
+                bundle = {"load": [
+                    ("load", self.scratch[init_vars[i]], curr_tmp),
+                    ("const", next_tmp, i + 1)
+                ]}
+                self.instrs.append(bundle)
+            else:
+                # Last load alone
+                self.add("load", ("load", self.scratch[init_vars[i]], curr_tmp))
 
         # Pre-allocate i_const values in CONTIGUOUS scratch locations for vload fusion
         # This allows vload to load batch items with a single instruction
@@ -1268,6 +1285,24 @@ class KernelBuilder:
         zero_const = i_const_base + 0  # = self.const_map[0]
         one_const = i_const_base + 1   # = self.const_map[1]
         two_const = i_const_base + 2   # = self.const_map[2]
+
+        # Pre-load hash constants (packed) - avoids individual loads during body construction
+        hash_consts = []
+        for (op1, val1, op2, op3, val3) in HASH_STAGES:
+            if val1 not in self.const_map:
+                hash_consts.append(val1)
+            if val3 not in self.const_map:
+                hash_consts.append(val3)
+        # Load hash constants in pairs
+        for i in range(0, len(hash_consts), 2):
+            addr1 = self.alloc_scratch()
+            self.const_map[hash_consts[i]] = addr1
+            if i + 1 < len(hash_consts):
+                addr2 = self.alloc_scratch()
+                self.const_map[hash_consts[i + 1]] = addr2
+                self.instrs.append({"load": [("const", addr1, hash_consts[i]), ("const", addr2, hash_consts[i + 1])]})
+            else:
+                self.add("load", ("const", addr1, hash_consts[i]))
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
