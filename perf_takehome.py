@@ -211,10 +211,6 @@ class KernelBuilder:
         max_interleave = min(available_scratch // n_colors, n_iters) if n_colors > 0 else n_iters
         max_interleave = (max_interleave // VLEN) * VLEN  # Round down to VLEN multiple
 
-        # Debug: print optimization info
-        print(f"Register allocation: n_internal={n_internal}, n_colors={n_colors}, savings={n_internal - n_colors}")
-        print(f"available={available_scratch}, max_interleave={max_interleave}, n_iters={n_iters}")
-
         if max_interleave < VLEN:
             return slots
 
@@ -867,6 +863,79 @@ class KernelBuilder:
 
         return result
 
+    def simple_vload_fusion_pass(self, slots):
+        """
+        Convert VLEN consecutive scalar loads to vload, but ONLY when the
+        addresses were computed by a valu that produces contiguous memory addresses.
+
+        Pattern:
+          valu: ('+', addr, base_vec, offset_vec)  where offset_vec contains 0,1,2,...,VLEN-1
+          load: ('load', dest0, addr)
+          load: ('load', dest1, addr+1)
+          ...
+
+        vload(dest, addr) reads: mem[scratch[addr] + i] for i in 0..VLEN-1
+        This matches the loads only if scratch[addr+i] = scratch[addr] + i,
+        which is guaranteed when valu computed addr+i = base + i.
+        """
+        result = []
+        i = 0
+        n = len(slots)
+
+        # Build reverse const map: scratch addr -> const value
+        addr_to_const = {addr: val for val, addr in self.const_map.items()}
+
+        # Track valu '+' outputs where offset is contiguous constants (0,1,2,...)
+        safe_vload_addrs = set()
+
+        while i < n:
+            engine, slot = slots[i]
+
+            # Track valu '+' that produce contiguous address patterns
+            if engine == "valu" and slot[0] == "+":
+                _, dest, base_vec, offset_vec = slot
+                # Check if offset_vec..offset_vec+VLEN-1 contain exactly 0, 1, ..., VLEN-1
+                is_contiguous_offset = True
+                for k in range(VLEN):
+                    addr = offset_vec + k
+                    if addr not in addr_to_const or addr_to_const[addr] != k:
+                        is_contiguous_offset = False
+                        break
+                if is_contiguous_offset:
+                    safe_vload_addrs.add(dest)
+
+            # Try to fuse VLEN consecutive loads
+            if engine == "load" and slot[0] == "load" and i + VLEN <= n:
+                _, dest0, addr0 = slot
+
+                # Only convert if addr0 was produced by a safe valu pattern
+                if addr0 in safe_vload_addrs:
+                    can_fuse = True
+
+                    # Check contiguous dest and addr
+                    for j in range(1, VLEN):
+                        if i + j >= n:
+                            can_fuse = False
+                            break
+                        next_engine, next_slot = slots[i + j]
+                        if next_engine != "load" or next_slot[0] != "load":
+                            can_fuse = False
+                            break
+                        _, next_dest, next_addr = next_slot
+                        if next_dest != dest0 + j or next_addr != addr0 + j:
+                            can_fuse = False
+                            break
+
+                    if can_fuse:
+                        result.append(("load", ("vload", dest0, addr0)))
+                        i += VLEN
+                        continue
+
+            result.append((engine, slot))
+            i += 1
+
+        return result
+
     def vstore_fusion_pass(self, slots):
         """
         Convert VLEN consecutive scalar stores to contiguous memory to a single vstore.
@@ -1020,14 +1089,6 @@ class KernelBuilder:
             # CSE pass
             slots = self.cse_pass(slots)
 
-        print(f"Optimization converged after {iteration} iterations")
-
-        # Dump optimized slots to file
-        with open("post_vectorize.txt", "w") as f:
-            f.write(f"Total slots: {len(slots)}\n\n")
-            for i, (engine, slot) in enumerate(slots):
-                f.write(f"{i}: {engine}: {slot}\n")
-
         # Filter out debug slots
         non_debug = [(i, e, s) for i, (e, s) in enumerate(slots) if e != "debug"]
         debug_slots = [(i, e, s) for i, (e, s) in enumerate(slots) if e == "debug"]
@@ -1131,36 +1192,6 @@ class KernelBuilder:
                 result.append(new_bundle)
                 scheduled_cycle[idx] = len(result) - 1
 
-        # Trace: analyze slot utilization
-        if True:  # Set to True to enable tracing
-            print(f"\n=== Instruction Trace Analysis ===")
-            print(f"Total cycles: {len(result)}")
-
-            # Count by engine type
-            engine_counts = {"alu": 0, "valu": 0, "load": 0, "store": 0, "flow": 0}
-            engine_slots_used = {"alu": 0, "valu": 0, "load": 0, "store": 0, "flow": 0}
-
-            for bundle in result:
-                for eng in engine_counts:
-                    if eng in bundle:
-                        engine_counts[eng] += 1
-                        engine_slots_used[eng] += len(bundle[eng])
-
-            print(f"\nEngine utilization (cycles with at least 1 slot used):")
-            for eng in ["alu", "valu", "load", "store", "flow"]:
-                pct = 100 * engine_counts[eng] / len(result) if result else 0
-                avg_slots = engine_slots_used[eng] / engine_counts[eng] if engine_counts[eng] > 0 else 0
-                print(f"  {eng}: {engine_counts[eng]} cycles ({pct:.1f}%), avg {avg_slots:.1f}/{SLOT_LIMITS[eng]} slots")
-
-            # Sample first 20 cycles
-            print(f"\nFirst 20 cycles:")
-            for i, bundle in enumerate(result[:20]):
-                parts = []
-                for eng in ["load", "alu", "valu", "flow", "store"]:
-                    if eng in bundle:
-                        parts.append(f"{eng}:{len(bundle[eng])}")
-                print(f"  Cycle {i}: {', '.join(parts)}")
-
         return result
 
     def add(self, engine, slot):
@@ -1223,9 +1254,14 @@ class KernelBuilder:
         # This allows vload to load batch items with a single instruction
         # IMPORTANT: Allocate these BEFORE zero_const/one_const/two_const so they're truly contiguous
         i_const_base = self.alloc_scratch("i_const_base", batch_size)
+        # Pack const loads - 2 per cycle (SLOT_LIMITS["load"] = 2)
+        for i in range(0, batch_size, 2):
+            bundle = {"load": [("const", i_const_base + i, i)]}
+            if i + 1 < batch_size:
+                bundle["load"].append(("const", i_const_base + i + 1, i + 1))
+            self.instrs.append(bundle)
+        # Register all in const_map
         for i in range(batch_size):
-            self.add("load", ("const", i_const_base + i, i))
-            # Register in const_map - OVERRIDE any previous allocation
             self.const_map[i] = i_const_base + i
 
         # Use the contiguous allocation for 0, 1, 2 as well
